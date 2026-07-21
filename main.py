@@ -130,6 +130,11 @@ with torch.no_grad():
     topk_idx = torch.topk(val_probs, k=k, dim=1).indices
     hits = torch.gather(y_val_t, 1, topk_idx)
     precision_val = hits.sum(dim=1).div(k).mean().item()
+<<<<<<< HEAD
+=======
+
+print(f"\nprecision_val (P@{k}): {precision_val:.4f}")
+>>>>>>> a54d206ecab7bad9aa1ea1c44e8c4793c1510722
 
 print(f"\nprecision_val (P@{k}): {precision_val:.4f}")
 
