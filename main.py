@@ -22,7 +22,7 @@ df_all = pd.concat((pd.read_csv(file, sep=";") for file in csv_files), ignore_in
 
 forget_df = pd.read_csv(os.path.join(folder_path, 'forget_data.csv'), sep=",")
 
-random_seed = 42
+random_seed = 1
 id_col = "user_id"
 
 #train/validation split for fine tuning
@@ -33,7 +33,7 @@ clean_df = df_all[~df_all[id_col].isin(forget_ids)].reset_index(drop=True)
 ids = clean_df[id_col].unique()
 rng = np.random.default_rng(random_seed)
 rng.shuffle(ids)
-val_frac = 0.15
+val_frac = 0.10
 n_val = int(len(ids) * val_frac)
 val_ids = set(ids[:n_val])
 
@@ -49,11 +49,27 @@ X_train = imputer.fit_transform(X_train).astype(np.float32)
 X_val = imputer.transform(X_val).astype(np.float32)
 
 
+X_forget, y_forget, _, _ = uf.prepare_data(
+    forget_df,
+    id_col=id_col,
+    target_prefix='target__'
+)
+
+X_forget = imputer.transform(X_forget).astype(np.float32)
+
+X_forget_t = torch.tensor(X_forget, device=device)
+y_forget_t = torch.tensor(y_forget.astype(np.float32), device=device)
+
+
+
 pos_counts = np.sum(y_train, axis=0)
 neg_counts = len(y_train) - pos_counts
 pos_weights = torch.tensor(neg_counts / (pos_counts + 1e-6), device=device, dtype=torch.float32)
-pos_weights = pos_weights.clamp(min=0.1, max=100.0)
+pos_weights = pos_weights.clamp(min=0.1, max=20.0)
 print(f"pos_weights: {pos_weights}")
+
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
 
 
 artifact_path = Path('data') / 'model_artifact'
@@ -89,16 +105,68 @@ print("\nModel successfully reconstructed and weights loaded.")
 X_train_t = torch.tensor(X_train, device=device)
 y_train_t = torch.tensor(y_train.astype(np.float32), device=device)
 
-finetune_epochs = 3
-finetune_lr = 1e-4
+finetune_epochs = 8
+finetune_lr = 5e-4
 batch_size = 256
 
+start_time = time.time()            #Timer start point of unlearning process not script
+
+print("\nGradient Ascent on forget data...")
+
+ascent_epochs = 3
+ascent_lr = 2e-4
+
+optimizer = torch.optim.Adam(model.parameters(), lr=ascent_lr)
+
 model.train()
-optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
-loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+for epoch in range(ascent_epochs):
+
+    perm = torch.randperm(X_forget_t.shape[0], device=device)
+
+    for i in range(0, len(perm), batch_size):
+
+        idx = perm[i:i+batch_size]
+
+        if len(idx) < 2:
+            continue
+
+        xb = X_forget_t[idx]
+        yb = y_forget_t[idx]
+
+        optimizer.zero_grad()
+
+        logits = model(xb)
+
+        loss = loss_fn(logits, yb)
+
+        # maximize the loss
+        (-loss).backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        optimizer.step()
+
+print("Gradient ascent finished.")
+
+with torch.no_grad():
+    ascent_diverged = any(not torch.isfinite(p).all() for p in model.parameters())
+if ascent_diverged:
+    print("Gradient ascent diverged (NaN/Inf detected) -- reloading pretrained weights before fine-tuning.")
+    model.load_state_dict(state_dict)
+    model.to(device)
+
+
+
+model.train()
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=finetune_lr,
+    weight_decay=1e-3
+)
 
 n = X_train_t.shape[0]
-start_time = time.time()            #Timer start point of unlearning process not script
+
 for epoch in range(finetune_epochs):
     perm = torch.randperm(n, device=device)
     epoch_loss = 0.0
@@ -117,7 +185,7 @@ for epoch in range(finetune_epochs):
 execution_time = time.time() - start_time  #Timer endpoint and total time for unlearning
 model.eval()
 
-print(f"\nFine-tuning finished in {execution_time:.1f}s")
+print(f"\nGradient ascent with Fine-tuning finished in {execution_time:.1f}s")
 
 #P@10 metric calculation
 X_val_t = torch.tensor(X_val, device=device)
@@ -130,13 +198,9 @@ with torch.no_grad():
     topk_idx = torch.topk(val_probs, k=k, dim=1).indices
     hits = torch.gather(y_val_t, 1, topk_idx)
     precision_val = hits.sum(dim=1).div(k).mean().item()
-<<<<<<< HEAD
-=======
 
 print(f"\nprecision_val (P@{k}): {precision_val:.4f}")
->>>>>>> a54d206ecab7bad9aa1ea1c44e8c4793c1510722
 
-print(f"\nprecision_val (P@{k}): {precision_val:.4f}")
 
 # MIA resistance metric calculation
 from sklearn.metrics import roc_auc_score
@@ -182,7 +246,7 @@ print(f"MIA Resistance Score (45%): {mia_resistance:.4f}")
 print(f"Combined Quality Score:     {estimated_score:.4f}")
 
 #new folder with 3 files - exec time, model, validation set
-group_name = "G20_V5_submission_test"
+group_name = "G20_Multiple"
 out_dir = Path(group_name)
 out_dir.mkdir(exist_ok=True)
 
